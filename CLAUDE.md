@@ -17,6 +17,7 @@ Projet perso à visée portfolio. DDD / hexagonal, CQRS ciblé, event-driven, CI
 | `docs/ARCHITECTURE.md` | Bounded contexts, arborescence, CQRS, messaging, persistance, concurrence |
 | `docs/GEOMETRY.md` | Spec paramétrique, algo de génération, golden fixture, Three.js |
 | `docs/DECISIONS.md` | Les ADR. **À lire avant de proposer un changement de stack.** |
+| `docs/DATA_MODEL.md` | MCD/MLD de l'étape 1 — schéma de persistance |
 | `docs/ROADMAP.md` | Étapes, definition of done |
 
 Ce fichier ne contient que ce qui doit être vrai à **chaque** tour. Le détail est dans `docs/`.

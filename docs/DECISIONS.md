@@ -298,3 +298,101 @@ usage perso autorisés, usage commercial interdit. Rédigée par des juristes, e
 Historique Git public et étalé, instance déployée en ligne avant tout le monde, articles
 expliquant les arbitrages. Un clone n'a rien de tout ça — et son auteur ne saura pas
 répondre à « pourquoi lock optimiste plutôt que pessimiste ici ? ».
+
+---
+
+## ADR-010 — Schéma de persistance de l'étape 1
+
+**Statut** : acté
+
+### Contexte
+
+`ROADMAP.md` fixe le périmètre de l'étape 1 : une section `grid`, une `Performance`,
+l'inventaire, le hold, la saga d'expiration, la projection `seat_availability`. Avant
+d'écrire la première migration, plusieurs points ne sont pas tranchés par
+`ARCHITECTURE.md` — en particulier la granularité de `seat_inventory` et ce que
+recouvre exactement l'« index unique partiel » qu'il mentionne. Le détail du schéma
+(MCD/MLD) est dans `docs/DATA_MODEL.md` ; cet ADR fixe les choix structurants qui le
+rendent possible.
+
+### Décision
+
+1. **Un schéma Postgres par bounded context** (`venue_catalog`, `ticketing`, `ordering`,
+   `notification`), un seul Postgres physique. Zéro FK traversant un schéma — une
+   référence à un autre contexte est un ID copié, reçu par événement d'intégration,
+   jamais une clé étrangère.
+
+2. **Pas de table `Seat` dans `VenueCatalog`.** Il ne stocke que le spec paramétrique
+   (JSONB). `SeatLayoutGenerator` est une fonction pure, invoquée une seule fois à la
+   création de la `Performance`. C'est `Ticketing` qui matérialise et qui possède
+   l'identité du siège dans ses propres lignes — jamais de second aller-retour vers
+   `VenueCatalog` après matérialisation (cf. `ARCHITECTURE.md` § Frontière).
+
+3. **`seat_inventory` : une ligne par siège**, avec sa propre colonne `version`.
+   L'agrégat « la section » (ADR-005) reste une frontière **transactionnelle** — le
+   handler `HoldSeats` lit/écrit plusieurs lignes d'une même section dans une seule
+   transaction — pas une ligne physique unique en JSONB. Cohérent avec l'
+   `UPDATE … WHERE version = :expected` déjà décrit dans `ARCHITECTURE.md`, et plus
+   simple à écrire à la main en DBAL qu'une manipulation de JSON.
+
+4. **`Hold` est une entité à part**, sans table de jonction many-to-many : un hold ne
+   détient chaque siège qu'une fois.
+   - `hold(id, performance_id, expires_at, idempotency_key UNIQUE, status)`
+   - `hold_seat(hold_id, performance_id, section_id, row_label, seat_number, released_at NULL)`,
+     **append-only** — jamais d'update, un insert au hold, `released_at` renseigné à la
+     libération.
+
+   L'index unique partiel de `ARCHITECTURE.md` porte sur cette table :
+   ```sql
+   CREATE UNIQUE INDEX ON hold_seat (performance_id, section_id, row_label, seat_number)
+     WHERE released_at IS NULL;
+   ```
+   C'est le filet ultime contre le double hold, indépendant du contrôle de version : si
+   le check applicatif a un bug, l'index bloque quand même. `seat_inventory` garde en
+   parallèle un statut + version dénormalisés pour les lectures rapides, écrits dans la
+   même transaction que l'insert dans `hold_seat`.
+
+5. **Le prix est snapshotté, mais pas sur chaque siège.** Une table
+   `performance_section(performance_id, section_id, label, price_cents)`, remplie une
+   fois à la création de la `Performance` depuis `VenuePublished`. `seat_inventory`
+   référence `section_id` et se joint pour le prix — pas de duplication sur 200+ lignes
+   de sièges identiques.
+
+6. **Pas de table d'idempotence générique.** Une contrainte `UNIQUE` sur
+   `hold.idempotency_key` suffit pour l'étape 1 — une seule commande mutative existe. Une
+   table partagée entre contextes violerait la décision 1 ; le pattern se répète
+   localement si un autre contexte en a besoin plus tard.
+
+7. **`seat_availability` est une table matérialisée dédiée**, une ligne par
+   performance, colonne `buffer BYTEA` déjà packée. Le projecteur flippe l'octet
+   concerné à chaque `SeatsHeld`/`SeatsReleased`, jamais de recalcul complet. Implique
+   que `seat_inventory` porte une colonne `seat_index` (0..N-1, ordre du golden
+   fixture) — nécessaire de toute façon pour le picking Three.js à l'étape 2, donc pas
+   un ajout gratuit.
+
+8. **`Show` n'est pas modélisé à l'étape 1.** `Performance` porte un simple champ
+   `title`. Une table `Show` attend qu'un besoin de lecture réel apparaisse (ex.
+   l'Accueil groupant plusieurs Performances) — conforme à ADR-006, « nommer le
+   problème de lecture avant d'ajouter ».
+
+### Conséquences
+
+- Le détail des tables (colonnes, types, contraintes) est dans `docs/DATA_MODEL.md`,
+  pas ici — cet ADR ne fixe que la structure et le pourquoi.
+- Trois défenses contre le double booking cohabitent, comme voulu par
+  `ARCHITECTURE.md` : l'index partiel sur `hold_seat` (filet ultime), le
+  `version` optimiste sur `seat_inventory` (contrôle applicatif), le retry sur
+  `ConcurrencyException` dans le middleware Messenger.
+- `hold_seat` grossit indéfiniment (append-only) ; un nettoyage périodique des lignes
+  libérées de longue date est un problème d'exploitation, pas de modélisation — à
+  traiter plus tard, pas maintenant.
+
+### Rejeté
+
+- **Une ligne JSONB par section pour `seat_inventory`** : complique l'`UPDATE`
+  optimiste écrit à la main et le picking par `instanceId` à l'étape 2.
+- **Table d'idempotence générique cross-contexte** : violerait l'isolation des
+  schémas (décision 1).
+- **Table `Seat` séparée dans `VenueCatalog`** : `VenueCatalog` ne doit rien savoir de
+  la vente ; ajouterait un aller-retour que la frontière interdit explicitement.
+- **`Show` modélisé dès l'étape 1** : aucun besoin de lecture ne le justifie encore.
